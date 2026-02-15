@@ -1,0 +1,466 @@
+You are implementing a Telegram task-management AI agent in Python.
+Read this entire file before writing any code. It is the single source of truth.
+
+================================================================================
+1. WHAT THIS BOT DOES
+================================================================================
+
+A Telegram bot where users talk in natural language (primarily Persian/Farsi).
+The bot manages tasks: creates, updates, deletes, queries, completes, sets reminders,
+handles recurring tasks, and calculates priority. Under 100 users. No buttons — pure text.
+
+================================================================================
+2. THE ONE RULE: LLM DECIDES EVERYTHING, CODE IS PLUMBING
+================================================================================
+
+There is ZERO algorithmic decision-making in Python code. No classifier. No state
+machine. No if/else routing based on intent. No hardcoded word lists for "yes"/"no".
+No ordinal maps. The LLM receives the user's message, a toolbox, and conversation
+history, and makes ALL decisions itself.
+
+Code is responsible ONLY for:
+  - /start → clear saved context, return static welcome text (must work if LLM is down)
+  - Injecting user_id into every DB query (user isolation — never trust LLM)
+  - Max 10 tool calls per message (prevent infinite loops)
+  - Rate limiting (10 messages/minute per user)
+  - Running in Docker (isolation)
+  - Executing tool calls mechanically and feeding results back to LLM
+
+================================================================================
+3. ARCHITECTURE: ReAct LOOP
+================================================================================
+
+User sends message
+  │
+  ▼
+Orchestrator (Python, mechanical):
+  1. /start? → clear context, return welcome (ONLY coded check)
+  2. Load saved ReAct context from MongoDB (if any → resume, else → fresh)
+  3. Build messages: [system_prompt] + [history] + [user message]
+  4. Run ReAct loop:
+     │
+     ├─ Call LLM with messages + tool definitions
+     │   ├─ LLM returns tool_calls → execute tools, feed results back, LOOP
+     │   ├─ LLM calls ask_user → save context to DB, return question, STOP
+     │   └─ LLM returns text (no tools) → clear context, return text, STOP
+     │
+  5. Persist user message + bot response in conversation_history
+  6. Send response to Telegram
+
+That's the entire orchestrator. No intent routing. No state transitions.
+
+================================================================================
+4. TECH STACK
+================================================================================
+
+Python 3.11+
+python-telegram-bot >= 21.0    # Telegram (async)
+litellm >= 1.30.0              # LLM client (OpenAI, Ollama, DeepSeek, Anthropic, ...)
+motor >= 3.3.0                 # MongoDB async driver
+pydantic >= 2.5.0              # Data models
+pydantic-settings >= 2.1.0     # Config from .env
+apscheduler >= 3.10.0          # Scheduled jobs (reminders, recurring)
+pymongo >= 4.6.0               # MongoDB (APScheduler job store)
+structlog >= 24.1.0            # Structured logging
+jdatetime >= 5.0.0             # Persian/Jalali calendar
+croniter >= 2.0.0              # Cron expression parsing
+pytz >= 2024.1                 # Timezone handling
+
+LLM config (one env var switches provider):
+  LLM_MODEL=ollama/deepseek-r1:14b        # local Ollama
+  LLM_MODEL=deepseek/deepseek-chat        # DeepSeek API
+  LLM_MODEL=gpt-4o-mini                   # OpenAI
+  LLM_MODEL=anthropic/claude-3-haiku      # Anthropic
+
+================================================================================
+5. TOOLS (the LLM's hands)
+================================================================================
+
+The LLM is blind. It MUST call tools to interact with reality. Never fabricate data.
+
+TOOL: get_current_datetime
+  Params: (none)
+  Returns: { iso, timezone, jalali_date, jalali_weekday, gregorian_date, time }
+  Notes: ALWAYS call before resolving relative dates ("فردا", "هفته بعد", etc.)
+
+TOOL: get_user_tasks
+  Params: status?("pending"|"done"|"all"), category?, due_date_from?, due_date_to?,
+          search_text?, sort_by?("priority"|"due_date"|"created_at"), limit?(20)
+  Returns: { count, tasks: [{ task_id, title, description, due_date, priority,
+             category, status, estimated_time_minutes, created_at }] }
+
+TOOL: create_task
+  Params: title(required), category(required), priority(required), description?,
+          due_date?, estimated_time_minutes?, reminder_at?, recurrence_pattern?
+  Returns: { task_id, title, priority, due_date }
+  Notes: Call calculate_priority FIRST to get the priority value.
+
+TOOL: update_task
+  Params: task_id(required), updates(dict of fields to change)
+  Returns: { success, updated_task }
+  Notes: Must know exact task_id. Call get_user_tasks first if unsure.
+
+TOOL: complete_task
+  Params: task_id(required)
+  Returns: { success, task_title }
+
+TOOL: delete_task
+  Params: task_id(required)
+  Returns: { success, deleted_task_title }
+  Notes: MUST confirm with user via ask_user BEFORE calling. Never delete unconfirmed.
+
+TOOL: calculate_priority
+  Params: title, category, due_date?, existing_task_count_by_priority?
+  Returns: { priority: 1-5, reasoning: str }
+  Notes: This is a sub-agent (uses LLM internally). Injects user's priority_prompt.
+         1=critical/urgent, 2=high, 3=medium, 4=low, 5=someday.
+
+TOOL: get_user_config
+  Params: (none)
+  Returns: { language, timezone, priority_prompt, quiet_hours, daily_summary, ... }
+
+TOOL: update_user_config
+  Params: key(str), value(any)
+  Returns: { success, updated_key, new_value }
+  Keys: priority_prompt, language, timezone, quiet_hours, daily_summary,
+        notification_enabled, default_category
+
+TOOL: set_reminder
+  Params: remind_at(ISO datetime), message(str), task_id?(str)
+  Returns: { reminder_id, remind_at }
+
+TOOL: ask_user
+  Params: question(str — in user's language), context?(str)
+  Returns: { waiting_for_response: true }
+  Notes: PAUSES the ReAct loop. Saves full conversation to DB. Next user message
+         resumes the loop with user's reply injected as tool result.
+
+================================================================================
+6. SYSTEM PROMPT (injected at runtime)
+================================================================================
+
+You are a personal task management assistant on Telegram.
+You help the user manage their tasks through natural conversation.
+
+LANGUAGE: Respond in the same language the user writes in (usually Persian/Farsi).
+
+CAPABILITIES:
+You have access to tools to interact with the user's task database.
+ALWAYS use tools to get real information — NEVER make up dates, tasks, or data.
+You are blind to the real world without tools. If you need the date, call
+get_current_datetime. If you need to see tasks, call get_user_tasks. NEVER assume.
+
+BEHAVIOR:
+1. When user describes a new task → gather info (ask if needed) → calculate_priority
+   → create_task
+2. When user wants to update/complete/delete → get_user_tasks first → find the right
+   task → act on it (confirm before delete)
+3. When user asks about tasks → get_current_datetime + get_user_tasks → format nicely
+4. When user changes settings → update_user_config
+5. When user is chatting → respond naturally, briefly
+
+CRITICAL RULES:
+- NEVER delete without asking the user to confirm first via ask_user.
+- NEVER fabricate task data. If unsure, call get_user_tasks.
+- NEVER make up the current date/time. Call get_current_datetime.
+- If multiple tasks could match, list them and ask the user to clarify.
+- Keep messages SHORT. This is Telegram, not email.
+- Use emojis sparingly: 📌 tasks, ✅ done, ❌ errors, 🔔 reminders
+- NEVER expose internal IDs, JSON, or technical details to the user.
+- For task lists use:  🔴 *title* — date  (🔴=p1, 🟠=p2, 🟡=p3, 🟢=p4, ⚪=p5)
+
+--- (appended dynamically per user) ---
+
+USER'S PRIORITY PREFERENCES:
+{user.priority_prompt or "No specific preferences set."}
+
+USER INFO:
+- Timezone: {user.timezone}
+- Language: {user.language}
+
+================================================================================
+7. MONGODB COLLECTIONS
+================================================================================
+
+Database: llm_todo_bot
+
+COLLECTION: tasks
+{
+  task_id: str (uuid4[:8]),          # user-facing short ID
+  user_id: str,                      # Telegram user ID
+  title: str,
+  description: str | null,
+  due_date: datetime | null,
+  priority: int (1-5),               # 1=highest
+  category: str,                     # health|work|family|learning|personal|other
+  status: str,                       # pending|done|cancelled
+  estimated_time_minutes: int | null,
+  tags: [str],
+  reminder: { enabled: bool, remind_at: datetime|null, reminded: bool },
+  recurrence: { enabled: bool, pattern: str|null, next_occurrence: datetime|null,
+                end_date: datetime|null },
+  created_at: datetime,
+  updated_at: datetime,
+  completed_at: datetime | null
+}
+Indexes:
+  (user_id, status), (user_id, due_date), (user_id, category),
+  (reminder.remind_at) sparse, (recurrence.next_occurrence) sparse,
+  (user_id, title: "text")
+
+COLLECTION: users
+{
+  user_id: str (unique),
+  telegram_username: str | null,
+  first_name: str,
+  last_name: str | null,
+  language: str (default "fa"),
+  timezone: str (default "Asia/Tehran"),
+  priority_prompt: str | null,       # e.g. "Health > Work > Family > Learning"
+  default_category: str (default "personal"),
+  notification_enabled: bool (default true),
+  quiet_hours: { enabled: bool, start: "HH:MM", end: "HH:MM" },
+  created_at: datetime,
+  updated_at: datetime,
+  message_count: int,
+  task_count: int
+}
+
+COLLECTION: conversation_contexts
+{
+  user_id: str (unique),
+  messages: [dict],                  # Full LLM message array at time of pause
+  updated_at: datetime
+}
+Lifecycle: Created when ask_user pauses → loaded+deleted when user replies → deleted on /start
+
+COLLECTION: conversation_history
+{
+  user_id: str,
+  role: str (user|assistant),
+  content: str,
+  timestamp: datetime,
+  metadata: { model_used: str|null, tokens_used: int|null, processing_time_ms: int|null }
+}
+Index: (user_id, timestamp DESC), TTL 30 days on timestamp
+
+COLLECTION: scheduled_jobs
+{
+  job_id: str,
+  user_id: str,
+  job_type: str (reminder|recurring_task|due_date_alert),
+  task_id: str | null,
+  trigger_at: datetime,
+  message: str,
+  recurrence_pattern: str | null,
+  status: str (pending|fired|cancelled),
+  created_at: datetime
+}
+
+================================================================================
+8. SCHEDULING & REMINDERS
+================================================================================
+
+Using APScheduler with MongoDB JobStore.
+
+REMINDERS:
+- When create_task has a due_date → auto-schedule reminder at 9 AM on due date
+- When user explicitly asks ("فردا بهم یادآوری کن") → set_reminder tool
+- On fire: check quiet hours → if quiet, defer to end of quiet hours
+- On fire: send Telegram message "🔔 یادآوری: {message}"
+
+DUE-DATE ALERTS:
+- Task due in >24h → 9 AM on due date: "امروز باید {title} انجام بدی"
+- Task due in 1-24h → 1 hour before (if specific time set)
+- Task overdue → 9 AM next day: "⚠️ این تسک دیروز باید انجام می‌شد: {title}"
+
+RECURRING TASKS:
+- Patterns: daily, weekly, monthly, weekdays, custom cron
+- One template task with recurrence.enabled=true
+- On trigger: send reminder, reset status to pending, calculate next_occurrence
+- If user deletes template → recurrence stops
+
+OVERDUE CHECKER:
+- Runs every hour
+- Finds tasks where due_date < now AND status = pending
+- Sends notification (max once per 24h per task)
+
+QUIET HOURS:
+- Default: disabled. User sets via "ساعت خاموشی: ۱۱ شب تا ۷ صبح"
+- During quiet hours: reminders deferred, bot still responds to messages
+
+TIMEZONE:
+- All MongoDB dates stored as UTC
+- All user-facing dates displayed in user's timezone (default: Asia/Tehran)
+- Use jdatetime for Jalali/Persian calendar display
+
+================================================================================
+9. CONVERSATION PATTERNS (examples — not coded logic)
+================================================================================
+
+SINGLE-TURN CREATE:
+  User: فردا ساعت ۱۰ جلسه با تیم فنی دارم، ۱ ساعت طول میکشه
+  LLM → get_current_datetime → calculate_priority → create_task → respond
+  Bot:  ✅ تسک اضافه شد! 📝 جلسه با تیم فنی 📅 فردا ۱۰ | 🏷 کار | 🟠 اولویت ۲
+
+MULTI-TURN GATHER:
+  User: باید برم دکتر
+  LLM → ask_user("کی باید بری؟") → PAUSE
+  User: فردا
+  LLM → get_current_datetime → calculate_priority → create_task → respond
+
+SEMANTIC COMPLETION:
+  User: چشمم خوب شد
+  LLM → get_user_tasks → finds "رفتن به چشم‌پزشکی" → complete_task → respond
+  Bot:  ✅ تسک «رفتن به چشم‌پزشکی» تکمیل شد!
+
+DELETE WITH CONFIRMATION:
+  User: تسک چشم‌پزشکی رو پاک کن
+  LLM → get_user_tasks(search="چشم‌پزشکی") → ask_user("مطمئنی حذف کنم؟") → PAUSE
+  User: آره
+  LLM → delete_task → respond
+  Bot:  ✅ حذف شد
+
+DISAMBIGUATION:
+  User: جلسه رو کنسل کن
+  LLM → get_user_tasks → finds 2 meetings → ask_user("کدوم؟ ۱.تیم فنی ۲.هفتگی")
+  User: اولی
+  LLM → understands "اولی" from its own list → ask_user("مطمئنی؟") → ...
+
+QUERY:
+  User: امروز چیکار دارم؟
+  LLM → get_current_datetime → get_user_tasks(due_date_from/to=today) → respond
+
+SET CONFIG:
+  User: اولویت من: سلامت > کار > خانواده > یادگیری
+  LLM → update_user_config(key="priority_prompt", value="1.Health 2.Work ...") → respond
+
+SET REMINDER:
+  User: فردا بهم بگو از فرزانه بپرسم کدوم کفش بگیرم
+  LLM → get_current_datetime → set_reminder(remind_at=tomorrow_9am, message="...") → respond
+
+================================================================================
+10. PROJECT STRUCTURE
+================================================================================
+
+llm-todo-bot/
+├── src/
+│   ├── main.py                      # Entry point
+│   ├── config.py                    # Pydantic settings from .env
+│   ├── bot/
+│   │   ├── handlers.py              # Telegram handlers → calls orchestrator
+│   │   └── middleware.py            # Rate limiting, onboarding
+│   ├── orchestrator/
+│   │   ├── orchestrator.py          # ReAct loop (mechanical, zero decisions)
+│   │   ├── tool_executor.py         # Executes tools safely
+│   │   ├── tool_registry.py         # All tool definitions (name, params, schema)
+│   │   ├── safety.py                # user_id injection, rate limits
+│   │   └── state_manager.py         # Save/resume ReAct context in MongoDB
+│   ├── tools/
+│   │   ├── datetime_tools.py        # get_current_datetime
+│   │   ├── task_tools.py            # CRUD: get/create/update/complete/delete
+│   │   ├── config_tools.py          # get/update user config
+│   │   ├── scheduling_tools.py      # set_reminder, recurring tasks, APScheduler
+│   │   ├── conversation_tools.py    # ask_user (pause/resume)
+│   │   └── priority_tools.py        # calculate_priority (sub-agent, uses LLM)
+│   ├── db/
+│   │   ├── database.py              # MongoDB connection + all CRUD methods
+│   │   └── models.py                # Pydantic models (Task, User, etc.)
+│   ├── llm/
+│   │   ├── client.py                # LiteLLM wrapper: call_with_tools, call_simple
+│   │   └── fallback.py              # Prompt-based tool calling for models w/o native support
+│   └── utils/
+│       ├── persian.py               # Persian numbers, Jalali dates
+│       ├── i18n.py                  # Language detection, template strings
+│       └── logging.py               # structlog setup
+├── prompts/
+│   ├── system_base.txt              # Base system prompt
+│   ├── priority_calculator.txt      # Sub-agent prompt
+│   ├── tool_descriptions.txt        # For prompt-based fallback
+│   └── fallback_responses.txt       # Error messages
+├── tests/
+│   ├── test_tools/                  # Unit tests per tool
+│   ├── test_orchestrator.py         # ReAct loop integration tests
+│   └── test_safety.py              # User isolation, rate limit tests
+├── .env.example
+├── Dockerfile                       # Non-root, read-only container
+├── docker-compose.yml               # bot + mongo + ollama(optional)
+├── requirements.txt
+└── README.md
+
+================================================================================
+11. DOCKER & SECURITY
+================================================================================
+
+Dockerfile: python:3.11-slim, non-root user (1000), WORKDIR /app
+docker-compose:
+  bot: read_only=true, tmpfs=/tmp, cpus=2.0, memory=1G, user=1000:1000
+  mongo: no ports exposed to host, only reachable in bot_net
+  ollama: optional, with GPU reservation
+
+Network: bot can reach Mongo + Ollama + Telegram API + LLM API. Nothing else.
+
+Safety:
+  - user_id injected by code into EVERY DB query (never trust LLM)
+  - Max 10 tool calls per message
+  - Rate limit: 10 messages/minute/user
+  - /start always works (no LLM dependency)
+  - Docker: read-only FS, non-root, resource limits, network isolation
+
+================================================================================
+12. IMPLEMENTATION ORDER
+================================================================================
+
+Day 1: Foundation + Docker
+  → config.py, models.py, database.py, bot/handlers.py (/start), Dockerfile,
+    docker-compose.yml. Test: bot responds to /start.
+
+Day 2: ReAct Loop + First Tools
+  → llm/client.py (call_with_tools), tool_registry.py, tool_executor.py,
+    datetime_tools.py, task_tools.py (get_user_tasks), orchestrator.py,
+    system_base.txt. Test: "سلام", "تسک‌هامو نشون بده".
+
+Day 3: Task Creation + Multi-Turn
+  → task_tools.py (create_task), priority_tools.py, conversation_tools.py (ask_user),
+    state_manager.py, persian.py. Test: create task with follow-ups.
+
+Day 4: Update/Complete/Delete
+  → task_tools.py (update, complete, delete), safety.py.
+    Test: update, complete, delete with disambiguation + confirmation.
+
+Day 5: Scheduling & Reminders
+  → scheduling_tools.py (set_reminder, recurring, APScheduler + MongoDB store).
+    Test: "فردا بهم بگو..." → receive reminder.
+
+Day 6: User Config + Polish
+  → config_tools.py, priority prompt injection, middleware.py (rate limit),
+    llm/fallback.py, error handling, logging.
+
+Day 7: Tests + Docs
+  → Unit tests, integration tests, E2E, README, Docker hardening.
+
+================================================================================
+13. ADDING A NEW TOOL (contributor guide)
+================================================================================
+
+1. Write a Python function in src/tools/your_tool.py:
+     async def your_tool(user_id: str, db: Database, **params) -> dict:
+         ...
+2. Register it in src/orchestrator/tool_registry.py:
+     "your_tool": { function: ..., description: ..., parameters: {...} }
+3. Done. The LLM auto-discovers it and decides when to use it.
+
+================================================================================
+14. KEY CONFIG (.env)
+================================================================================
+
+TELEGRAM_BOT_TOKEN=...
+MONGO_URI=mongodb://mongo:27017
+MONGO_DB_NAME=llm_todo_bot
+LLM_MODEL=ollama/deepseek-r1:14b
+LLM_BASE_URL=http://ollama:11434     # only for Ollama
+LLM_TEMPERATURE=0.3
+LLM_MAX_TOKENS=2000
+MAX_TOOL_CALLS_PER_MESSAGE=10
+RATE_LIMIT_PER_MINUTE=10
+MAX_TASKS_PER_USER=200
