@@ -1,0 +1,13 @@
+# Example: delete task with confirmation
+user_messages:
+  - "تسک خرید کفش رو پاک کن"
+  - "آره"
+expected_tool_sequence_turn1:
+  - get_user_tasks
+  - ask_user
+expected_tool_sequence_turn2:
+  - request_task_deletion
+expected_response_turn1_contains:
+  - "مطمئنی"
+expected_response_turn2_contains:
+  - "حذف"

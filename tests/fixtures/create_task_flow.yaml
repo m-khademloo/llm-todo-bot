@@ -1,0 +1,11 @@
+# Example conversation flow: create task (happy path)
+# Used for integration tests or replay tests.
+user_messages:
+  - "فردا ساعت ۱۰ جلسه با تیم فنی دارم، حدود ۱ ساعت"
+expected_tool_sequence:
+  - get_current_datetime
+  - calculate_priority
+  - create_task
+expected_response_contains:
+  - "تسک"
+  - "جلسه"
