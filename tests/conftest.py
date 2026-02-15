@@ -131,18 +131,33 @@ class MockDatabase:
         user_id: str,
         filters: TaskFilter | None = None,
         limit: int = 20,
+        sort_by: str = "priority",
     ) -> list[Task]:
-        tasks = self._user_tasks(user_id)
+        tasks = list(self._user_tasks(user_id))
         result = []
         for t in tasks:
-            if filters and filters.status and t.get("status") != filters.status:
+            if filters and filters.status is not None and filters.status != "all" and t.get("status") != filters.status:
                 continue
             if filters and filters.category and t.get("category") != filters.category:
                 continue
+            if filters and (filters.due_date_from or filters.due_date_to):
+                due = t.get("due_date")
+                if due:
+                    due_dt = due if hasattr(due, "year") else datetime.fromisoformat(str(due).replace("Z", "+00:00"))
+                    if filters.due_date_from and due_dt < filters.due_date_from:
+                        continue
+                    if filters.due_date_to and due_dt > filters.due_date_to:
+                        continue
+                elif filters.due_date_from or filters.due_date_to:
+                    continue
             result.append(Task.model_validate(t))
-            if len(result) >= limit:
-                break
-        return result
+        if sort_by == "priority":
+            result.sort(key=lambda x: x.priority)
+        elif sort_by == "due_date":
+            result.sort(key=lambda x: x.due_date or datetime.max)
+        elif sort_by == "created_at":
+            result.sort(key=lambda x: x.created_at or datetime.min)
+        return result[:limit]
 
     async def get_or_create_user(self, user_id: str, **info: Any) -> User:
         if user_id in self._users:

@@ -72,12 +72,17 @@ class Database:
         )
 
     async def query_tasks(
-        self, user_id: str, filters: TaskFilter | None = None, limit: int = 20
+        self,
+        user_id: str,
+        filters: TaskFilter | None = None,
+        limit: int = 20,
+        sort_by: str = "priority",
     ) -> list[Task]:
         q: dict[str, Any] = {"user_id": user_id}
         if filters:
-            if filters.status:
+            if filters.status and filters.status != "all":
                 q["status"] = filters.status
+            # when status is None or "all", do not filter by status
             if filters.category:
                 q["category"] = filters.category
             if filters.due_date_from or filters.due_date_to:
@@ -86,7 +91,8 @@ class Database:
                     q["due_date"]["$gte"] = filters.due_date_from
                 if filters.due_date_to:
                     q["due_date"]["$lte"] = filters.due_date_to
-        cursor = self.tasks.find(q).limit(limit)
+        sort_key = sort_by if sort_by in ("priority", "due_date", "created_at") else "priority"
+        cursor = self.tasks.find(q).sort(sort_key, 1).limit(limit)
         return [Task.model_validate(d) async for d in cursor]
 
     async def search_tasks(self, user_id: str, query: str) -> list[Task]:

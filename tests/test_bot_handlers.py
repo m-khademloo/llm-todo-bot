@@ -7,8 +7,9 @@ from src.bot import handlers
 
 
 def test_create_bot_returns_application():
-    with pytest.raises(NotImplementedError):
-        handlers.create_bot("dummy_token", MagicMock())
+    app = handlers.create_bot("dummy_token", MagicMock())
+    from telegram.ext import Application
+    assert isinstance(app, Application)
 
 
 def test_create_bot_accepts_token_and_orchestrator():

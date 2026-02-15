@@ -15,16 +15,24 @@ async def test_llm_client_init():
 
 @pytest.mark.asyncio
 async def test_call_with_tools_returns_llm_response():
-    client = LLMClient(model="test", base_url=None)
-    with pytest.raises(NotImplementedError):
-        await client.call_with_tools(messages=[], tools=[])
+    from unittest.mock import AsyncMock
+    client = LLMClient(model="openai/gpt-4o-mini", base_url=None)
+    with patch("src.llm.client.acompletion", new_callable=AsyncMock) as m:
+        m.return_value = type("R", (), {"choices": [type("C", (), {"message": type("M", (), {"content": "Hi", "tool_calls": None})()})()]})()
+        out = await client.call_with_tools(messages=[{"role": "user", "content": "Hi"}], tools=[])
+        assert isinstance(out, LLMResponse)
+        assert out.content == "Hi"
 
 
 @pytest.mark.asyncio
 async def test_call_simple_returns_string():
-    client = LLMClient(model="test", base_url=None)
-    with pytest.raises(NotImplementedError):
-        await client.call_simple(messages=[])
+    from unittest.mock import AsyncMock
+    client = LLMClient(model="openai/gpt-4o-mini", base_url=None)
+    with patch("src.llm.client.acompletion", new_callable=AsyncMock) as m:
+        m.return_value = type("R", (), {"choices": [type("C", (), {"message": type("M", (), {"content": "OK"})()})()]})()
+        out = await client.call_simple(messages=[{"role": "user", "content": "Hi"}])
+        assert isinstance(out, str)
+        assert out == "OK"
 
 
 def test_llm_response_has_content_and_tool_calls():
