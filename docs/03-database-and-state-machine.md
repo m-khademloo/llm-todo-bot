@@ -103,32 +103,34 @@ This string is injected into the Priority Agent's system prompt.
 
 ---
 
-## Collection 3: `conversation_states`
+## Collection 3: `conversation_contexts`
 
-The FSM state for each user, persisted so it survives bot restarts.
+Saves the paused ReAct loop state when the LLM calls `ask_user` and waits for a response.
+If this document exists for a user, the next message resumes the saved loop.
+If it doesn't exist, a fresh ReAct loop starts.
+
+**This replaces the old 10-state FSM.** The LLM manages all "logical states"
+(gathering data, confirming deletion, disambiguating, etc.) through the
+conversation history stored in `messages`.
 
 ```json
 {
   "_id": "ObjectId",
   "user_id": "string (Telegram user ID)",
-  "fsm_state": "string (see FSM states below)",
-  "context": {
-    "intent": "string | null (current intent being processed)",
-    "partial_task": "dict | null (task being gathered)",
-    "task_reference": "string | null (task_id being updated/deleted/completed)",
-    "matched_tasks": "list | null (multiple matches for disambiguation)",
-    "gather_turn_count": "int (how many gather questions asked)",
-    "confirmation_data": "dict | null (what we're asking to confirm)",
-    "pending_action": "string | null (action waiting for confirmation)"
-  },
+  "messages": "list[dict] — full LLM message array at time of pause",
   "updated_at": "datetime"
 }
 ```
 
 ### Indexes
 ```python
-conversation_states.create_index("user_id", unique=True)
+conversation_contexts.create_index("user_id", unique=True)
 ```
+
+### Lifecycle
+- **Created** when LLM calls `ask_user` (loop pauses)
+- **Loaded + deleted** when user sends next message (loop resumes)
+- **Deleted** on `/start` (reset)
 
 ---
 
@@ -189,173 +191,108 @@ scheduled_jobs.create_index("task_id", sparse=True)
 
 ---
 
-## Finite State Machine (FSM)
+## Conversation State (Replacing the Old FSM)
 
-### States
+### The Old Problem: 10+ Coded States
 
-```
-┌─────────┐
-│  IDLE   │ ◄─── Default state. Waiting for user input.
-└────┬────┘
-     │ (user sends message)
-     │
-     ▼
-┌─────────────────┐
-│   CLASSIFYING   │  Transient state (no user waiting here).
-└────┬────────────┘  Classifier runs and immediately transitions.
-     │
-     ├── intent = create_task ──────► GATHERING_CREATE
-     ├── intent = update_task ──────► IDENTIFYING_TASK (then GATHERING_UPDATE)
-     ├── intent = delete_task ──────► IDENTIFYING_TASK (then CONFIRMING_DELETE)
-     ├── intent = complete_task ────► IDENTIFYING_TASK (then CONFIRMING_COMPLETE)
-     ├── intent = query_tasks ──────► (execute immediately, return to IDLE)
-     ├── intent = set_config ───────► CONFIRMING_CONFIG
-     ├── intent = smalltalk ────────► (respond immediately, return to IDLE)
-     └── intent = unclear ──────────► (ask clarification, return to IDLE)
-```
+The old design had 10+ states (`GATHERING_CREATE`, `CONFIRMING_DELETE`, `DISAMBIGUATING`, etc.)
+with hardcoded transition rules enforced by Python code. This was deterministic routing
+that should be the LLM's job.
 
-### Detailed State Diagram
+### The New Approach: Conversation Context IS the State
+
+The LLM doesn't need a coded state machine. Its "state" is the **conversation history**.
+When the LLM called `ask_user("کی باید بری چشم‌پزشکی؟")` and paused, the conversation
+history contains that question. When the user replies "فردا", the LLM sees:
 
 ```
-                          /start
-                            │
-                            ▼
-                     ┌──────────┐
-          ┌─────────│   IDLE   │◄──────────────────────────────┐
-          │         └──────────┘                                │
-          │              │                                      │
-          │         (message)                                   │
-          │              │                                      │
-          │              ▼                                      │
-          │      ┌───────────────┐                             │
-          │      │  CLASSIFYING  │                             │
-          │      └───────┬───────┘                             │
-          │              │                                      │
-          │    ┌─────────┼─────────┬──────────┐               │
-          │    ▼         ▼         ▼          ▼               │
-          │ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────┐    │
-          │ │GATHER  │ │IDENTIFY│ │CONFIRM │ │ EXECUTE  │    │
-          │ │CREATE  │ │TASK    │ │CONFIG  │ │ & REPLY  │────┘
-          │ └───┬────┘ └───┬────┘ └───┬────┘ └──────────┘
-          │     │          │          │
-          │     ▼          ▼          │     ┌──────────┐
-          │ ┌────────┐ ┌────────┐    ├────►│  DONE    │───┐
-          │ │CONFIRM │ │GATHER  │    │     └──────────┘   │
-          │ │CREATE  │ │UPDATE  │    │                    │
-          │ └───┬────┘ └───┬────┘    │                    │
-          │     │          │         │                    │
-          │     ▼          ▼         ▼                    │
-          │ ┌────────┐ ┌────────┐ ┌────────┐             │
-          │ │EXECUTE │ │CONFIRM │ │CONFIRM │             │
-          │ │CREATE  │ │UPDATE  │ │DELETE  │             │
-          │ └───┬────┘ └───┬────┘ └───┬────┘             │
-          │     │          │          │                   │
-          │     └──────────┴──────────┘                   │
-          │                │                              │
-          │                ▼                              │
-          │         ┌──────────┐                          │
-          │         │   IDLE   │◄─────────────────────────┘
-          │         └──────────┘
-          │
-          │  (at ANY point, user sends /start)
-          └──────────────────────────────────────► IDLE (reset)
+[system prompt]
+[user] باید برم چشم‌پزشکی
+[assistant → tool call: ask_user("کی باید بری چشم‌پزشکی؟")]
+[tool result: waiting_for_response]
+[user] فردا
 ```
 
-### State Definitions
+The LLM knows exactly where it is — it was gathering task creation data. No coded
+state machine needed.
 
-| State | Description | Valid Transitions |
-|-------|-------------|-------------------|
-| `idle` | Waiting for user input. No active conversation. | → classifying |
-| `gathering_create` | Collecting data for new task. Multi-turn. | → confirming_create, → idle (/start) |
-| `gathering_update` | Collecting update data. | → confirming_update, → idle (/start) |
-| `identifying_task` | Need to figure out which task user means. | → gathering_update, → confirming_delete, → confirming_complete, → idle (/start) |
-| `confirming_create` | Showing task summary, waiting for yes/no. | → idle (execute or cancel) |
-| `confirming_update` | Showing update summary, waiting for yes/no. | → idle (execute or cancel) |
-| `confirming_delete` | Asking if user really wants to delete. | → idle (execute or cancel) |
-| `confirming_complete` | Asking if user wants to mark as done. | → idle (execute or cancel) |
-| `confirming_config` | Asking if config change is correct. | → idle (execute or cancel) |
-| `disambiguating` | Multiple tasks match, asking user to pick one. | → confirming_*, → idle (/start) |
+### What We Store in MongoDB
 
-### State Transition Rules
+Only TWO things:
+1. **Conversation history** (the `conversation_history` collection — already defined above)
+2. **Saved ReAct context** (for resuming after `ask_user` pauses the loop)
+
+```json
+// conversation_contexts collection — saves the paused ReAct loop
+{
+  "_id": "ObjectId",
+  "user_id": "string (Telegram user ID)",
+  "messages": "list[dict] — the full LLM message array at time of pause",
+  "updated_at": "datetime"
+}
+```
+
+When the user sends a new message:
+- If there's a saved context → **resume** the ReAct loop with the user's reply appended
+- If there's no saved context → **start fresh** ReAct loop
+
+When `/start` is sent:
+- Delete saved context → next message starts a fresh loop
 
 ```python
-VALID_TRANSITIONS = {
-    "idle":                ["gathering_create", "gathering_update", "identifying_task",
-                            "confirming_config", "confirming_complete", "disambiguating", "idle"],
-    "gathering_create":    ["confirming_create", "gathering_create", "idle"],
-    "gathering_update":    ["confirming_update", "gathering_update", "idle"],
-    "identifying_task":    ["gathering_update", "confirming_delete", "confirming_complete",
-                            "disambiguating", "idle"],
-    "confirming_create":   ["idle"],
-    "confirming_update":   ["idle"],
-    "confirming_delete":   ["idle"],
-    "confirming_complete": ["idle"],
-    "confirming_config":   ["idle"],
-    "disambiguating":      ["confirming_delete", "confirming_complete", "confirming_update",
-                            "gathering_update", "idle"],
-}
+# The entire "state machine" in code:
+
+async def handle_message(self, user_id: str, message: str) -> str:
+    if message.strip() == "/start":
+        await self.db.clear_conversation_context(user_id)
+        return WELCOME_TEXT
+
+    saved = await self.db.get_conversation_context(user_id)
+
+    if saved:
+        # Resume: user is replying to a question from the ReAct loop
+        messages = saved["messages"]
+        messages.append({"role": "tool", "content": json.dumps({"user_response": message})})
+    else:
+        # Fresh: new conversation turn
+        messages = self._build_fresh_messages(user_id, message)
+
+    return await self._react_loop(user_id, messages)
+```
+
+**That's it.** No states, no transitions, no validation rules. The LLM manages all
+"logical states" (gathering, confirming, disambiguating) through conversation context.
+
+### Diagram: Old vs New
+
+```
+OLD (10 coded states):
+  idle → classifying → gathering_create → confirming_create → idle
+  idle → classifying → identifying_task → confirming_delete → idle
+  ... (10+ states, 20+ transitions, all coded in Python)
+
+NEW (2 infrastructure states):
+  no_context → ReAct loop → (LLM returns text) → no_context
+  no_context → ReAct loop → (LLM calls ask_user) → has_context
+  has_context → Resume ReAct loop → ... → no_context
+  /start → clear context → no_context
 ```
 
 ### /start Command — The Universal Reset
 
-At any state, if the user sends `/start`:
-1. Current state context is cleared
-2. State is set to `idle`
-3. Bot responds with welcome message
+At any point, if the user sends `/start`:
+1. Saved conversation context is deleted
+2. Static welcome message is returned
+3. No LLM call needed (must work even if LLM is down)
 4. No data is lost (tasks already saved are kept; only in-progress conversation is reset)
 
-```python
-async def handle_start(user_id: str, state: ConversationState):
-    state.fsm_state = "idle"
-    state.context = {}  # Clear all context
-    await db.save_state(state)
-    return "سلام! 👋 من دستیار مدیریت تسک‌هات هستم. بگو چیکار کنم!"
-```
+### Why This Works
 
----
-
-## Task Identification (The "Which Task?" Problem)
-
-When a user says "چشمم خوب شد" (my eye is better), we need to find the matching task. This is handled by the **task identification** flow:
-
-### Strategy
-
-```python
-async def identify_task(user_id: str, message: str, intent: str) -> IdentificationResult:
-    """Find which task the user is referring to."""
-
-    # 1. Get all pending tasks for user
-    tasks = await db.get_tasks(user_id, status="pending")
-
-    if not tasks:
-        return IdentificationResult(found=False, message="تسک فعالی نداری!")
-
-    # 2. Use LLM to match message to tasks
-    match_result = await llm.call(
-        system_prompt=TASK_MATCHER_PROMPT,
-        user_message=json.dumps({
-            "user_message": message,
-            "tasks": [t.summary() for t in tasks]
-        })
-    )
-
-    # 3. Evaluate matches
-    matches = match_result["matches"]  # List of {task_id, confidence}
-
-    if len(matches) == 0:
-        return IdentificationResult(found=False, message="هیچ تسکی پیدا نکردم که مربوط باشه. کدوم تسکو میگی؟")
-
-    if len(matches) == 1 and matches[0]["confidence"] > 0.8:
-        return IdentificationResult(found=True, task_id=matches[0]["task_id"])
-
-    # Multiple matches or low confidence → ask user
-    return IdentificationResult(
-        found=False,
-        ambiguous=True,
-        candidates=matches,
-        message=format_disambiguation(matches)  # "کدوم یکی از اینا رو میگی؟\n1. ...\n2. ..."
-    )
-```
+The LLM is better at managing conversational state than coded rules because:
+- It handles interruptions naturally ("باید برم دکتر" → [gathering] → "راستی امروز چیکار دارم?" → [handles query, returns to gathering])
+- It handles ambiguity ("اونو عوض کن" → it looks at context to understand "اون")
+- It handles confirmation in any language/phrasing (not just {"آره", "بله", ...})
+- It handles novel situations we didn't code for
 
 ---
 
@@ -478,33 +415,12 @@ class Task(BaseModel):
     completed_at: datetime | None = None
 
 
-class FSMState(str, Enum):
-    IDLE = "idle"
-    GATHERING_CREATE = "gathering_create"
-    GATHERING_UPDATE = "gathering_update"
-    IDENTIFYING_TASK = "identifying_task"
-    CONFIRMING_CREATE = "confirming_create"
-    CONFIRMING_UPDATE = "confirming_update"
-    CONFIRMING_DELETE = "confirming_delete"
-    CONFIRMING_COMPLETE = "confirming_complete"
-    CONFIRMING_CONFIG = "confirming_config"
-    DISAMBIGUATING = "disambiguating"
-
-
-class ConversationContext(BaseModel):
-    intent: str | None = None
-    partial_task: dict | None = None
-    task_reference: str | None = None
-    matched_tasks: list[dict] | None = None
-    gather_turn_count: int = 0
-    confirmation_data: dict | None = None
-    pending_action: str | None = None
-
-
-class ConversationState(BaseModel):
+class SavedReActContext(BaseModel):
+    """Saved state of the ReAct loop when paused by ask_user.
+    The LLM manages all 'logical states' (gathering, confirming, etc.)
+    through the conversation history. No coded FSM states."""
     user_id: str
-    fsm_state: FSMState = FSMState.IDLE
-    context: ConversationContext = ConversationContext()
+    messages: list[dict]  # Full LLM message array at time of pause
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 ```
 
@@ -535,7 +451,7 @@ class Settings(BaseSettings):
 
     # Limits
     MAX_TASKS_PER_USER: int = 200
-    MAX_GATHER_TURNS: int = 3
+    MAX_TOOL_CALLS_PER_MESSAGE: int = 10
     RATE_LIMIT_PER_MINUTE: int = 10
 
     class Config:

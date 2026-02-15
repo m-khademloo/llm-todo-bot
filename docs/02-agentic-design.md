@@ -23,7 +23,7 @@ the LLM gets a toolbox and **decides for itself** what to do.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                        ORCHESTRATOR                           │
-│                   (Python, runs the loop)                     │
+│               (Python, MECHANICAL — zero decisions)           │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────────┐ │
 │  │                     ReAct Loop                           │ │
@@ -32,22 +32,29 @@ the LLM gets a toolbox and **decides for itself** what to do.
 │  │   │ PLANNER  │───►│ EXECUTOR │───►│  OBSERVER    │──┐  │ │
 │  │   │ (LLM)    │    │ (Python) │    │  (feed back) │  │  │ │
 │  │   │          │    │          │    │              │  │  │ │
-│  │   │ Thinks:  │    │ Runs the │    │ Adds tool    │  │  │ │
-│  │   │ "I need  │    │ tool     │    │ result to    │  │  │ │
-│  │   │ to call  │    │ safely   │    │ conversation │  │  │ │
-│  │   │ tool X"  │    │          │    │              │  │  │ │
+│  │   │ ALL      │    │ Runs the │    │ Adds tool    │  │  │ │
+│  │   │ DECISIONS│    │ tool     │    │ result to    │  │  │ │
+│  │   │ HERE     │    │ blindly  │    │ conversation │  │  │ │
+│  │   │          │    │          │    │              │  │  │ │
 │  │   └──────────┘    └──────────┘    └──────────────┘  │  │ │
 │  │        ▲                                            │  │ │
 │  │        └────────────────────────────────────────────┘  │ │
 │  │                    (loop until done)                    │ │
 │  └─────────────────────────────────────────────────────────┘ │
 │                                                              │
-│  SAFETY LAYER (enforced by code, not by LLM):                │
-│  ├── Max 8 tool calls per message (prevent infinite loops)   │
-│  ├── Destructive tools require user confirmation             │
-│  ├── All DB queries scoped to user_id                        │
-│  ├── State machine controls multi-turn flows                 │
-│  └── Docker isolation prevents system-level damage           │
+│  SAFETY LAYER (the ONLY deterministic code):                 │
+│  ├── /start command → reset (must work even if LLM is down) │
+│  ├── Max 10 tool calls per message (prevent infinite loops)  │
+│  ├── All DB queries auto-scoped to user_id                   │
+│  ├── Rate limiting (10 messages/minute)                      │
+│  └── Docker isolation                                        │
+│                                                              │
+│  NO deterministic logic for:                                 │
+│  ├── Understanding what user means (LLM decides)             │
+│  ├── Which tool to call (LLM decides)                        │
+│  ├── Understanding "آره" = yes (LLM decides)                 │
+│  ├── Formatting responses (LLM decides)                      │
+│  └── State transitions (LLM decides via conversation context)│
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -140,16 +147,16 @@ TOOL_REGISTRY = {
         "side_effects": True,
     },
 
-    "request_task_deletion": {
-        "description": "Request deletion of task(s). This does NOT delete immediately — "
-                       "it triggers a confirmation flow. The user must confirm. "
-                       "Use this for single or bulk deletes.",
+    "delete_task": {
+        "description": "Permanently delete a task. "
+                       "IMPORTANT: Before calling this, you MUST have asked the user to confirm "
+                       "and received a positive response. NEVER call this without prior confirmation "
+                       "in the conversation. If you haven't confirmed yet, use ask_user first.",
         "parameters": {
-            "task_ids": "list[str] (one or more task IDs to delete)",
-            "reason": "str (why — shown to user in confirmation message)",
+            "task_id": "str (required — the exact task ID to delete)",
         },
-        "returns": "{ confirmation_requested: true, tasks_to_delete: [...] }",
-        "side_effects": True,  # Triggers state change, not actual deletion
+        "returns": "{ success, deleted_task_title }",
+        "side_effects": True,
     },
 
     # ─── PRIORITY ──────────────────────────────────────────────
@@ -227,131 +234,151 @@ We get the **same capability** (knowing the time, querying data) through safe, t
 
 ---
 
-## The Orchestrator — The Loop Runner
+## The Orchestrator — Pure Plumbing, Zero Decisions
 
-The Orchestrator is the **only** piece of code that talks to both the LLM and the tools.
-It runs the ReAct loop, enforces safety, and manages state.
+The Orchestrator's job is MECHANICAL. It is a dumb pipe:
+1. Receive message from Telegram
+2. Load context from MongoDB
+3. Build LLM messages
+4. Run the ReAct loop (LLM ↔ tools)
+5. Save state + history
+6. Send response to Telegram
+
+**The Orchestrator makes ZERO decisions about what to do.** It never checks intent,
+never parses confirmation words, never routes based on state. ALL of that is the LLM's job.
+
+The only `if` statements in the Orchestrator are **safety infrastructure**:
+- `/start` → reset (must work even if LLM is down)
+- Max tool call iterations
+- `user_id` injection
 
 ```python
 class Orchestrator:
     """
-    The main loop runner. Receives a user message, runs the Planner LLM
-    in a tool-calling loop, and returns the final response.
+    Pure plumbing. Runs the ReAct loop.
+    Makes ZERO decisions about meaning, intent, or routing.
+    ALL intelligence is in the LLM.
     """
 
     def __init__(self, db: Database, llm: LLMClient, scheduler: SchedulerService):
         self.db = db
         self.llm = llm
         self.scheduler = scheduler
-        self.tool_executor = ToolExecutor(db, scheduler)  # Runs tools safely
-        self.state_machine = StateMachine(db)
+        self.tool_executor = ToolExecutor(db, llm, scheduler)
 
     async def handle_message(self, user_id: str, message: str) -> str:
         """Main entry point. One user message → one bot response."""
 
-        # ──── 1. HARD COMMANDS (bypass LLM entirely) ────
+        # ──── SAFETY: /start must work even if LLM is down ────
         if message.strip() == "/start":
-            await self.state_machine.reset(user_id)
-            return await self._welcome_message(user_id)
-        if message.strip() == "/help":
-            return HELP_TEXT
-        if message.strip() == "/cancel":
-            await self.state_machine.reset(user_id)
-            return "لغو شد. چیکار کنم؟"
+            await self.db.clear_conversation_context(user_id)
+            return WELCOME_TEXT  # Static string, no LLM needed
 
-        # ──── 2. LOAD CONTEXT ────
-        state = await self.state_machine.get_state(user_id)
+        # ──── 1. LOAD CONTEXT (mechanical) ────
         user = await self.db.get_or_create_user(user_id)
         history = await self.db.get_history(user_id, limit=10)
+        saved_context = await self.db.get_conversation_context(user_id)
 
-        # ──── 3. HANDLE PENDING CONFIRMATION ────
-        #   If the bot asked "are you sure?" and user is responding:
-        if state.fsm_state in ("confirming_delete", "confirming_complete"):
-            return await self._handle_confirmation(user_id, message, state)
+        # ──── 2. BUILD LLM MESSAGES (mechanical) ────
+        system_prompt = self._build_system_prompt(user)
+        messages = self._build_messages(system_prompt, history, saved_context, message)
 
-        # ──── 4. BUILD LLM MESSAGES ────
-        system_prompt = await self._build_system_prompt(user)
-        messages = self._build_messages(system_prompt, history, message, state)
+        # ──── 3. RUN THE ReAct LOOP (LLM makes ALL decisions) ────
+        response = await self._react_loop(user_id, messages)
 
-        # ──── 5. RUN THE ReAct LOOP ────
-        response = await self._react_loop(
-            user_id=user_id,
-            messages=messages,
-            state=state,
-            max_iterations=8,  # Safety: max 8 tool calls per message
-        )
-
-        # ──── 6. SAVE STATE & HISTORY ────
+        # ──── 4. PERSIST (mechanical) ────
         await self.db.add_message(user_id, "user", message)
         await self.db.add_message(user_id, "assistant", response)
 
         return response
 
-    async def _react_loop(
-        self,
-        user_id: str,
-        messages: list[dict],
-        state: ConversationState,
-        max_iterations: int = 8,
-    ) -> str:
+    async def _react_loop(self, user_id: str, messages: list[dict]) -> str:
         """
-        The core loop. Call LLM → if it wants tools → execute → feed back → repeat.
-        Stop when LLM returns a text response (no tool calls).
+        The ReAct loop. This code is MECHANICAL — it just:
+        1. Calls LLM
+        2. If LLM wants a tool → executes it, feeds result back
+        3. If LLM returns text → done
+        
+        NO decisions about meaning, intent, routing, or anything.
         """
 
-        for iteration in range(max_iterations):
-            # Call LLM with tool definitions
+        for iteration in range(10):  # SAFETY: max 10 tool calls
+            # Call LLM with all tools available
             llm_response = await self.llm.call_with_tools(
                 messages=messages,
-                tools=self._get_tool_definitions(user_id),
+                tools=self._get_tool_definitions(),
                 temperature=0.3,
             )
 
-            # ── Case A: LLM wants to call tool(s) ──
+            # ── LLM wants to call tool(s) → execute mechanically ──
             if llm_response.tool_calls:
+                # Add LLM's response (with tool calls) to conversation
+                messages.append({
+                    "role": "assistant",
+                    "content": llm_response.content,
+                    "tool_calls": [tc.model_dump() for tc in llm_response.tool_calls],
+                })
+
                 for tool_call in llm_response.tool_calls:
                     tool_name = tool_call.function.name
                     tool_args = json.loads(tool_call.function.arguments)
 
-                    # SAFETY: inject user_id into every DB tool call
+                    # SAFETY: inject user_id (the ONLY thing code controls)
                     tool_args["_user_id"] = user_id
 
-                    # SAFETY: check if tool requires confirmation
-                    if self._needs_confirmation(tool_name, tool_args):
-                        # Don't execute — transition to confirmation state
-                        await self._enter_confirmation(user_id, tool_name, tool_args, state)
-                        # Return the confirmation question
-                        return self._format_confirmation_question(tool_name, tool_args)
-
-                    # Execute the tool
+                    # Execute the tool (no if/else on tool_name — just run it)
                     result = await self.tool_executor.execute(tool_name, tool_args)
 
-                    # SPECIAL: ask_user → pause the loop, save state, return question
+                    # SPECIAL: ask_user → pause loop, save context, return question
                     if tool_name == "ask_user":
-                        await self._save_agent_state(user_id, messages, state, tool_args)
-                        return tool_args["question"]
+                        await self.db.save_conversation_context(user_id, messages)
+                        return result["question"]
 
-                    # Feed result back to LLM
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [tool_call],
-                    })
+                    # Feed result back to LLM (LLM decides what to do next)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": json.dumps(result, ensure_ascii=False, default=str),
                     })
 
-            # ── Case B: LLM returns a text response (done!) ──
+            # ── LLM returns text (no tool calls) → done ──
             else:
-                final_text = llm_response.content
-                await self.state_machine.transition(user_id, "idle")
-                return final_text
+                # Clear saved context (conversation is complete)
+                await self.db.clear_conversation_context(user_id)
+                return llm_response.content
 
-        # ── Safety: max iterations reached ──
+        # SAFETY: max iterations
         return "یه مشکلی پیش اومده 🔧 لطفا دوباره امتحان کن"
 ```
+
+### What Was Removed (Compared to Previous Version)
+
+| Removed | Why | Who handles it now |
+|---------|-----|-------------------|
+| `if state.fsm_state in ("confirming_delete", ...)` | Deterministic routing | LLM sees the conversation history and knows it asked for confirmation |
+| `_needs_confirmation(tool_name)` | Code deciding when to confirm | LLM uses `request_task_deletion` tool, which returns confirmation question |
+| `_handle_confirmation(message)` | Code parsing "آره" = yes | LLM understands "آره" from context |
+| `_format_confirmation_question()` | Code formatting questions | LLM writes the question in natural language |
+| `state_machine.transition()` | Code managing FSM states | LLM manages state through conversation context |
+| `if message == "/help"` / `"/cancel"` | Code routing commands | LLM sees "/help" and responds accordingly |
+
+### What Remains in Code
+
+Only **safety infrastructure** that MUST be deterministic:
+
+```python
+# These are the ONLY `if` statements in the orchestrator:
+
+if message.strip() == "/start":     # Must work even if LLM is down
+    ...
+
+if iteration >= 10:                 # Prevent infinite loops
+    ...
+
+tool_args["_user_id"] = user_id     # User isolation (never trust LLM with this)
+```
+
+**Everything else — understanding, planning, confirming, formatting, routing — is LLM.**
 
 ### The Key Insight: One LLM, Many Tools
 
@@ -399,20 +426,29 @@ LLM: "✅ تسک «رفتن به چشم‌پزشکی» تکمیل شد! خوشح
 **Example: "همه تسک‌های یادگیری رو پاک کن" (Delete all learning tasks)**
 
 ```
-LLM thinks: "User wants to delete learning tasks. Let me find them first."
+LLM thinks: "User wants to delete learning tasks. Let me find them."
 → calls get_user_tasks(status="pending")
 ← [{ id: "a1", title: "کتاب پایتون", cat: "learning" },
     { id: "b2", title: "دوره React", cat: "learning" },
     { id: "c3", title: "جلسه کاری", cat: "work" },
-    { id: "d4", title: "خوندن مقاله ML", cat: "personal" }]  ← Note: this is learning but categorized as personal!
-LLM thinks: "a1 and b2 are clearly learning. d4 'reading ML paper' is also learning-related
-even though it's categorized as personal. But I shouldn't guess — only include the ones
-clearly learning. Actually, I should include d4 too since the user said 'all learning tasks'.
-But deleting is destructive — I must confirm."
-→ calls request_task_deletion(task_ids=["a1", "b2", "d4"], reason="all learning-related tasks")
-ORCHESTRATOR intercepts: "This is destructive. Ask confirmation."
-← Bot: "⚠️ ۳ تسک یادگیری پیدا شد:\n۱. کتاب پایتون\n۲. دوره React\n۳. خوندن مقاله ML\n\nهمشو پاک کنم؟"
+    { id: "d4", title: "خوندن مقاله ML", cat: "personal" }]
+
+LLM thinks: "a1, b2 are learning. d4 'reading ML paper' is also learning-related
+even though categorized as personal. This is a bulk delete — I MUST confirm."
+→ calls ask_user(question="⚠️ ۳ تسک یادگیری پیدا شد:\n۱. کتاب پایتون\n۲. دوره React\n۳. خوندن مقاله ML\n\nهمشو پاک کنم؟")
+PAUSE → saved to DB
+
+--- User replies: "آره مطمئنم" ---
+
+LLM sees conversation history: it listed 3 tasks, asked for confirmation, user confirmed.
+→ calls delete_task(task_id="a1")
+→ calls delete_task(task_id="b2")
+→ calls delete_task(task_id="d4")
+LLM: "✅ ۳ تسک حذف شد"
 ```
+
+Notice: **no code intercepted anything.** The LLM decided to confirm, the LLM understood
+"آره مطمئنم", the LLM decided to proceed. All code did was run the tools mechanically.
 
 ---
 
@@ -623,29 +659,35 @@ class ToolExecutor:
         return {"waiting_for_response": True, "question": question, "context": context}
 ```
 
-### Tool Safety Properties
+### Confirmation: LLM's Responsibility, Not Code
 
-Every tool has two key properties:
+In the old design, code intercepted `delete_task` and forced a confirmation. Now:
 
-| Property | Meaning |
-|----------|---------|
-| `side_effects: False` | Read-only. Can be called freely. (get_current_datetime, get_user_tasks, get_user_config) |
-| `side_effects: True` | Modifies data. Orchestrator may intercept. (create_task, update_task, request_task_deletion) |
+**The LLM handles confirmation through conversation.** The system prompt tells it:
+"NEVER delete without asking the user first." The LLM uses `ask_user` to confirm,
+then calls `delete_task` only after the user says yes.
 
-The Orchestrator uses this to decide whether to intercept:
-
-```python
-def _needs_confirmation(self, tool_name: str, args: dict) -> bool:
-    """Does this tool call need user confirmation before executing?"""
-    # Deletion ALWAYS needs confirmation
-    if tool_name == "request_task_deletion":
-        return True
-    # Bulk operations need confirmation
-    if tool_name == "update_task" and len(args.get("task_ids", [])) > 1:
-        return True
-    # Everything else is fine
-    return False
 ```
+User: "تسک چشم‌پزشکی رو پاک کن"
+LLM thinks: "User wants to delete. I must confirm first."
+→ calls get_user_tasks(search_text="چشم‌پزشکی")
+← [{ task_id: "a1", title: "رفتن به چشم‌پزشکی" }]
+→ calls ask_user(question="مطمئنی «رفتن به چشم‌پزشکی» رو حذف کنم؟")
+PAUSE → user replies: "آره"
+LLM sees conversation: it asked for confirmation, user said "آره"
+→ calls delete_task(task_id="a1")
+← { success: true }
+LLM: "✅ تسک حذف شد"
+```
+
+No code checks "is this a delete?". No code parses "آره". The LLM understands
+the entire conversation flow. If the user had said "نه" instead, the LLM would
+have said "باشه، پاکش نمیکنم" — **without any coded if/else**.
+
+What if the LLM ignores the rule and deletes without confirming? The system prompt
+is the enforcement mechanism. For this project (<100 users, we control the prompts),
+this is sufficient. If you need harder guarantees, you can add a code-level audit log
+that flags unconfirmed deletions — but that's monitoring, not decision-making.
 
 ---
 

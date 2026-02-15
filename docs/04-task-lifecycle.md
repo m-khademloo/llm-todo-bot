@@ -1,54 +1,51 @@
 # 04 - Task Lifecycle & Classification
 
-## Message Classification Pipeline
+## How Messages Are Handled (No Coded Pipeline)
 
-Every incoming message goes through this pipeline:
+There is **no coded classification pipeline**. Every message goes through the same path:
 
 ```
 User Message
      │
      ▼
 ┌─────────────────────┐
-│ 1. PREPROCESSING    │  - Normalize Unicode (Persian)
-│                     │  - Trim whitespace
-│                     │  - Detect language
+│ /start?             │  YES → Reset (the ONLY coded check)
+│ (safety command)     │  NO  → Continue
 └─────────┬───────────┘
           │
           ▼
 ┌─────────────────────┐
-│ 2. COMMAND CHECK    │  - /start → reset state
-│                     │  - /help → show help
-│                     │  - /tasks → query all pending
-│                     │  - /cancel → cancel current flow
-│                     │  - Otherwise → LLM classification
+│ Saved ReAct context?│  YES → Resume loop (user is replying to ask_user)
+│                     │  NO  → Start fresh ReAct loop
 └─────────┬───────────┘
           │
           ▼
 ┌─────────────────────┐
-│ 3. STATE CHECK      │  If state != idle:
-│                     │    → Route to current flow handler
-│                     │    (don't re-classify)
-│                     │  If state == idle:
-│                     │    → Classify with LLM
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ 4. LLM CLASSIFY     │  Single LLM call → structured JSON
-│                     │  Returns: intent + entities + confidence
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ 5. ROUTE & EXECUTE  │  Based on intent → specific handler
+│ ReAct Loop          │  LLM decides EVERYTHING:
+│ (LLM + tools)       │  - What the user means
+│                     │  - Which tools to call
+│                     │  - What to ask
+│                     │  - How to respond
 └─────────────────────┘
 ```
 
+There is no "classify then route" step. The LLM sees the message, the tools, and
+the conversation history, and decides the entire flow itself.
+
+**Why no classifier?** Because classification is just the LLM's first thought.
+When it sees "باید برم چشم‌پزشکی", it doesn't output `{intent: "create_task"}` to a
+coded router — it thinks "this is a new task" and immediately starts calling
+`get_current_datetime()`, `ask_user("کی باید بری؟")`, etc. The classification and
+execution happen in one continuous LLM reasoning chain.
+
 ---
 
-## Intent Classification Details
+## What the LLM Understands (Not Coded — Just Examples)
 
-### The 8 Intent Types
+The following are examples of how the LLM interprets messages. None of this is coded
+in Python. The LLM handles all of this through its system prompt and reasoning.
+
+### Types of User Messages
 
 #### 1. `create_task` — User wants to add something new
 

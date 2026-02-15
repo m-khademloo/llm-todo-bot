@@ -104,20 +104,17 @@ Bot:  ✅ حذف شد
 ```
 
 **How "اولی" (the first one) is resolved:**
-The disambiguation state stores the numbered list. When user responds with a number, ordinal, or position reference:
-- "اولی" / "۱" / "یکی" → index 0
-- "دومی" / "۲" → index 1
-- "آخری" → last item
-- Full text match → direct match
 
-```python
-ORDINAL_MAP = {
-    "اولی": 0, "اول": 0, "یکی": 0, "۱": 0, "1": 0,
-    "دومی": 1, "دوم": 1, "۲": 1, "2": 1,
-    "سومی": 2, "سوم": 2, "۳": 2, "3": 2,
-    "آخری": -1, "آخر": -1,
-}
-```
+Entirely by the LLM. The conversation history contains the numbered list that the
+LLM itself generated. When the user replies "اولی", the LLM sees its own previous
+message with the list and understands "اولی" = item 1.
+
+No `ORDINAL_MAP` dictionary. No coded index lookup. The LLM handles:
+- "اولی" / "۱" / "یکی" / "اون بالایی" → first item
+- "دومی" / "۲" → second item
+- "آخری" → last item
+- "جلسه تیمی" → matches by content, not position
+- "هر دوتاشو" → both items (novel case no hardcoded map could handle)
 
 ### Pattern 5: Confirmation Flow
 
@@ -132,16 +129,19 @@ User: آره مطمئنم
 Bot:  ✅ ۸ تسک حذف شد
 ```
 
-**Confirmation acceptance patterns:**
-- آره / بله / اوکی / باشه / ok / yes → accept
-- نه / نچ / بیخیال / no / cancel → reject
-- For destructive bulk: require "آره مطمئنم" or "yes I'm sure"
+**Confirmation handling: entirely LLM-driven.**
 
-```python
-CONFIRMATION_ACCEPT = {"آره", "بله", "اوکی", "باشه", "ok", "yes", "اره", "بعله", "آری"}
-CONFIRMATION_REJECT = {"نه", "نچ", "بیخیال", "no", "cancel", "لغو", "ولش"}
-CONFIRMATION_STRONG = {"آره مطمئنم", "yes i'm sure", "بله مطمئنم"}  # For destructive bulk
-```
+There are NO hardcoded word lists for confirmation. The LLM understands:
+- "آره" / "بله" / "اوکی" / any affirmative in any language → proceed
+- "نه" / "بیخیال" / "ولش" / any negative → cancel
+- "آره مطمئنم" vs just "آره" → the LLM decides how strongly to enforce based on context
+- Ambiguous responses ("hmm", "شاید") → the LLM asks again
+
+This is better than a word list because:
+- Handles typos ("اهر" instead of "آره")
+- Handles colloquial variations we never coded
+- Handles mixed languages
+- Handles indirect confirmations ("بزن بره" = do it)
 
 ### Pattern 6: Smalltalk & Help
 
