@@ -9,7 +9,7 @@ from src.bot.handlers import create_bot
 from src.tools.scheduling_tools import SchedulerService
 
 
-async def main() -> None:
+async def _setup():
     settings = Settings()
     db = Database(settings.MONGO_URI, settings.MONGO_DB_NAME)
     await db.setup_indexes()
@@ -18,8 +18,13 @@ async def main() -> None:
     orchestrator = Orchestrator(db=db, llm=llm, scheduler=scheduler)
     bot = create_bot(settings.TELEGRAM_BOT_TOKEN, orchestrator)
     await scheduler.start(bot)
-    await bot.run_polling()
+    return bot
+
+
+def main() -> None:
+    bot = asyncio.run(_setup())
+    bot.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
