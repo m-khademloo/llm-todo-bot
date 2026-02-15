@@ -109,7 +109,10 @@ Keep messages SHORT. Use emojis sparingly."""
             messages.append({
                 "role": "assistant",
                 "content": llm_response.content or "",
-                "tool_calls": [{"id": tc.id, "function": {"name": name, "arguments": args_str}} for tc, name, args_str in tool_calls_list],
+                "tool_calls": [
+                    {"id": tc.id, "type": "function", "function": {"name": name, "arguments": args_str}}
+                    for tc, name, args_str in tool_calls_list
+                ],
             })
             for tc, name, args_str in tool_calls_list:
                 try:
