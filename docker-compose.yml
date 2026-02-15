@@ -1,12 +1,16 @@
 # Single stack: bot only. Mongo and LLM are external (host or cloud).
 # Set TELEGRAM_BOT_TOKEN, MONGO_URI, LLM_MODEL (and LLM_BASE_URL / API keys) in .env.
 # Works with: Ollama (host), OpenAI, DeepSeek, Claude, etc. via LiteLLM.
+#
+# network_mode: host lets the bot use 127.0.0.1 for Ollama/Mongo on the host
+# (Ollama often listens only on 127.0.0.1, so host.docker.internal can refuse).
 
 services:
   bot:
     build: .
     env_file: .env
     restart: unless-stopped
+    network_mode: host
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - MONGO_URI=${MONGO_URI}
@@ -15,11 +19,3 @@ services:
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.3}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-1000}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - bot_net
-
-networks:
-  bot_net:
-    driver: bridge
