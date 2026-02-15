@@ -95,26 +95,29 @@ llm-todo-bot/
 ```
                     main.py
                        │
-              ┌────────┼────────┐
-              ▼        ▼        ▼
-           bot/    core/    scheduler
-              │        │        │
-              ▼        ▼        ▼
-           agents/ ◄───┘    db/
-              │              │
-              ▼              ▼
-           llm/          MongoDB
+              ┌────────┼──────────┐
+              ▼        ▼          ▼
+           bot/    orchestrator/  scheduler (APScheduler)
+              │        │
+              │        ├── tools/      (tool implementations)
+              │        ├── llm/        (LLM client)
+              │        └── db/         (database layer)
+              │
+              └──► orchestrator/       (bot calls orchestrator.handle_message)
 ```
 
 **Key rules:**
-- `bot/` depends on `agents/` and `core/` — never the other way around
-- `agents/` depends on `llm/` and `db/` — never on `bot/`
-- `core/` depends on `db/` — never on `agents/` or `bot/`
+- `bot/` depends on `orchestrator/` only — calls `orchestrator.handle_message(user_id, text)`
+- `orchestrator/` depends on `tools/`, `llm/`, `db/` — it's the central coordinator
+- `tools/` depends on `db/` and `llm/` (some tools like `calculate_priority` are sub-agents)
 - `db/` depends on nothing (only `motor` and `pydantic`)
 - `llm/` depends on nothing (only `litellm`)
 - `utils/` depends on nothing (pure utility functions)
 
-This means you can test agents without Telegram, test core logic without LLM, and test DB layer without anything else.
+**Adding a new tool requires touching:**
+1. `src/tools/your_tool.py` — implement the function
+2. `src/orchestrator/tool_registry.py` — register it with name + description
+3. That's it. The ReAct loop auto-discovers registered tools.
 
 ---
 
@@ -122,8 +125,8 @@ This means you can test agents without Telegram, test core logic without LLM, an
 
 Build in this exact order. Each phase is independently testable.
 
-### Phase 1: Foundation (Day 1)
-**Goal:** Bot runs, connects to MongoDB, responds to `/start`
+### Phase 1: Foundation + Docker (Day 1)
+**Goal:** Bot runs in Docker, connects to MongoDB, responds to `/start`
 
 | # | Task | File(s) |
 |---|------|---------|
@@ -132,7 +135,8 @@ Build in this exact order. Each phase is independently testable.
 | 1.3 | Create data models | `src/db/models.py` |
 | 1.4 | Create database layer | `src/db/database.py` |
 | 1.5 | Create basic bot with `/start` handler | `src/bot/handlers.py`, `src/main.py` |
-| 1.6 | Test: bot responds to `/start`, user saved in DB | Manual test |
+| 1.6 | Docker setup (bot + mongo) | `Dockerfile`, `docker-compose.yml` |
+| 1.7 | Test: `docker-compose up`, bot responds to `/start` | Manual test |
 
 **Dependencies to install:**
 ```
@@ -149,83 +153,78 @@ croniter>=2.0.0
 pytz>=2024.1
 ```
 
-### Phase 2: LLM Integration (Day 2)
-**Goal:** Bot classifies messages and responds
+### Phase 2: ReAct Loop + First Tools (Day 2)
+**Goal:** The core agentic loop works. Bot can respond using tool calls.
 
 | # | Task | File(s) |
 |---|------|---------|
-| 2.1 | Create LLM client wrapper | `src/llm/client.py` |
-| 2.2 | Write classifier prompt | `prompts/classifier.txt` |
-| 2.3 | Implement classifier agent | `src/agents/classifier.py` |
-| 2.4 | Create orchestrator skeleton | `src/agents/orchestrator.py` |
-| 2.5 | Wire bot → orchestrator → classifier | `src/bot/handlers.py` |
-| 2.6 | Test: send messages, see classification logs | Manual test |
+| 2.1 | LLM client with tool-calling support | `src/llm/client.py` |
+| 2.2 | Tool registry + definitions | `src/orchestrator/tool_registry.py` |
+| 2.3 | Tool executor (safe runner) | `src/orchestrator/tool_executor.py` |
+| 2.4 | Implement `get_current_datetime` tool | `src/tools/datetime_tools.py` |
+| 2.5 | Implement `get_user_tasks` tool | `src/tools/task_tools.py` |
+| 2.6 | Build the ReAct loop in orchestrator | `src/orchestrator/orchestrator.py` |
+| 2.7 | System prompt (base) | `prompts/system_base.txt` |
+| 2.8 | Wire bot → orchestrator | `src/bot/handlers.py` |
+| 2.9 | Test: "سلام", "ساعت چنده؟", "تسک‌هامو نشون بده" | Manual test |
 
-### Phase 3: Task Creation (Day 3)
-**Goal:** Full create-task flow works
-
-| # | Task | File(s) |
-|---|------|---------|
-| 3.1 | Implement state machine | `src/core/state_machine.py` |
-| 3.2 | Write data gatherer prompt | `prompts/data_gatherer.txt` |
-| 3.3 | Implement data gatherer agent | `src/agents/data_gatherer.py` |
-| 3.4 | Implement date resolver | `src/core/date_resolver.py` |
-| 3.5 | Implement task service (create) | `src/core/task_service.py` |
-| 3.6 | Write priority prompt | `prompts/priority_calculator.txt` |
-| 3.7 | Implement priority agent | `src/agents/priority.py` |
-| 3.8 | Implement response formatter | `src/agents/response_formatter.py` |
-| 3.9 | Wire full create flow in orchestrator | `src/agents/orchestrator.py` |
-| 3.10 | Test: create task via conversation | Manual test |
-
-### Phase 4: Task Queries (Day 4)
-**Goal:** User can query tasks
+### Phase 3: Task Creation + Multi-Turn (Day 3)
+**Goal:** Full create-task flow with ask_user for gathering info
 
 | # | Task | File(s) |
 |---|------|---------|
-| 4.1 | Implement query builder | `src/core/task_service.py` |
-| 4.2 | Implement task list formatting | `src/bot/formatters.py` |
-| 4.3 | Persian date display | `src/utils/persian.py` |
-| 4.4 | Wire query flow in orchestrator | `src/agents/orchestrator.py` |
-| 4.5 | Test: "امروز چیکار دارم؟" works | Manual test |
+| 3.1 | Implement `create_task` tool | `src/tools/task_tools.py` |
+| 3.2 | Implement `calculate_priority` sub-agent tool | `src/tools/priority_tools.py` |
+| 3.3 | Implement `ask_user` tool (pause/resume loop) | `src/tools/conversation_tools.py` |
+| 3.4 | State manager (save/resume ReAct loop) | `src/orchestrator/state_manager.py` |
+| 3.5 | Persian date utilities | `src/utils/persian.py` |
+| 3.6 | Test: create task with follow-up questions | Manual test |
 
-### Phase 5: Update, Complete, Delete (Day 5)
-**Goal:** Full CRUD working
-
-| # | Task | File(s) |
-|---|------|---------|
-| 5.1 | Implement task matcher agent | `src/agents/task_matcher.py` |
-| 5.2 | Implement disambiguation flow | `src/agents/orchestrator.py` |
-| 5.3 | Implement update flow | `src/core/task_service.py` |
-| 5.4 | Implement complete flow | `src/core/task_service.py` |
-| 5.5 | Implement delete flow (with confirmation) | `src/core/task_service.py` |
-| 5.6 | Wire all in orchestrator | `src/agents/orchestrator.py` |
-| 5.7 | Test: update, complete, delete tasks | Manual test |
-
-### Phase 6: Scheduling & Reminders (Day 6)
-**Goal:** Reminders and recurring tasks work
+### Phase 4: Update, Complete, Delete (Day 4)
+**Goal:** Full CRUD. LLM resolves "which task?" by reading DB.
 
 | # | Task | File(s) |
 |---|------|---------|
-| 6.1 | Set up APScheduler with MongoDB store | `src/core/scheduler_service.py` |
-| 6.2 | Implement reminder creation | `src/core/scheduler_service.py` |
-| 6.3 | Implement reminder firing | `src/core/scheduler_service.py` |
-| 6.4 | Implement due-date alerts | `src/core/scheduler_service.py` |
-| 6.5 | Implement recurring tasks | `src/core/scheduler_service.py` |
-| 6.6 | Test: set reminder, wait, receive notification | Manual test |
+| 4.1 | Implement `update_task` tool | `src/tools/task_tools.py` |
+| 4.2 | Implement `complete_task` tool | `src/tools/task_tools.py` |
+| 4.3 | Implement `request_task_deletion` tool | `src/tools/task_tools.py` |
+| 4.4 | Safety layer (confirmation enforcement) | `src/orchestrator/safety.py` |
+| 4.5 | Test: update, complete, delete with disambiguation | Manual test |
 
-### Phase 7: Polish (Day 7)
-**Goal:** Production-ready
+### Phase 5: Scheduling & Reminders (Day 5)
+**Goal:** Reminders, recurring tasks, due-date alerts
 
 | # | Task | File(s) |
 |---|------|---------|
-| 7.1 | User config (priority prompt, quiet hours) | `src/core/user_service.py` |
-| 7.2 | Rate limiting | `src/bot/middleware.py` |
-| 7.3 | Error handling & recovery | Throughout |
-| 7.4 | Logging | `src/utils/logging.py` |
-| 7.5 | Smalltalk handling | `src/agents/orchestrator.py` |
-| 7.6 | Docker setup | `Dockerfile`, `docker-compose.yml` |
-| 7.7 | Write tests | `tests/` |
-| 7.8 | README | `README.md` |
+| 5.1 | Set up APScheduler with MongoDB store | `src/tools/scheduling_tools.py` |
+| 5.2 | Implement `set_reminder` tool | `src/tools/scheduling_tools.py` |
+| 5.3 | Implement recurring task triggers | `src/tools/scheduling_tools.py` |
+| 5.4 | Due-date alert system | `src/tools/scheduling_tools.py` |
+| 5.5 | Test: "فردا بهم بگو..." → receive reminder next day | Manual test |
+
+### Phase 6: User Config + Polish (Day 6)
+**Goal:** User preferences, error handling, fallback mode
+
+| # | Task | File(s) |
+|---|------|---------|
+| 6.1 | Implement `get_user_config` + `update_user_config` tools | `src/tools/config_tools.py` |
+| 6.2 | Priority prompt integration | `src/orchestrator/orchestrator.py` |
+| 6.3 | Rate limiting middleware | `src/bot/middleware.py` |
+| 6.4 | Prompt-based tool calling fallback (for models without native support) | `src/llm/fallback.py` |
+| 6.5 | Error handling & graceful recovery | Throughout |
+| 6.6 | Structured logging | `src/utils/logging.py` |
+
+### Phase 7: Testing + Docs (Day 7)
+**Goal:** Tests, README, final polish
+
+| # | Task | File(s) |
+|---|------|---------|
+| 7.1 | Unit tests for each tool | `tests/test_tools/` |
+| 7.2 | Integration tests for ReAct loop | `tests/test_orchestrator.py` |
+| 7.3 | Safety layer tests | `tests/test_safety.py` |
+| 7.4 | E2E test with real LLM | `tests/test_e2e.py` |
+| 7.5 | README with setup instructions | `README.md` |
+| 7.6 | Docker hardening (non-root, read-only, resource limits) | `Dockerfile`, `docker-compose.yml` |
 
 ---
 
@@ -238,27 +237,32 @@ import asyncio
 from src.config import settings
 from src.db.database import Database
 from src.llm.client import LLMClient
+from src.orchestrator.orchestrator import Orchestrator
+from src.orchestrator.tool_executor import ToolExecutor
 from src.bot.handlers import create_bot
-from src.core.scheduler_service import SchedulerService
+from src.tools.scheduling_tools import SchedulerService
 
 async def main():
     # 1. Connect to MongoDB
     db = Database(settings.MONGO_URI, settings.MONGO_DB_NAME)
     await db.setup_indexes()
 
-    # 2. Create LLM client
+    # 2. Create LLM client (with tool-calling support)
     llm = LLMClient(model=settings.LLM_MODEL, base_url=settings.LLM_BASE_URL)
 
     # 3. Create scheduler
     scheduler = SchedulerService(settings.MONGO_URI, settings.MONGO_DB_NAME)
 
-    # 4. Create and start bot
-    bot = create_bot(settings.TELEGRAM_BOT_TOKEN, db, llm, scheduler)
+    # 4. Create the orchestrator (the brain)
+    orchestrator = Orchestrator(db=db, llm=llm, scheduler=scheduler)
 
-    # 5. Start scheduler
+    # 5. Create and start Telegram bot (thin layer, delegates to orchestrator)
+    bot = create_bot(settings.TELEGRAM_BOT_TOKEN, orchestrator)
+
+    # 6. Start scheduler
     await scheduler.start(bot)
 
-    # 6. Run bot (polling mode for development)
+    # 7. Run bot (polling mode)
     await bot.run_polling()
 
 if __name__ == "__main__":
@@ -270,71 +274,72 @@ if __name__ == "__main__":
 No DI framework. Simple constructor injection:
 
 ```python
-# The orchestrator receives its dependencies via __init__
 class Orchestrator:
     def __init__(self, db: Database, llm: LLMClient, scheduler: SchedulerService):
         self.db = db
         self.llm = llm
         self.scheduler = scheduler
-        self.classifier = ClassifierAgent(llm)
-        self.resolver = ResolverAgent(llm)     # Resolves user message against real DB data
-        self.gatherer = DataGathererAgent(llm)
-        self.priority = PriorityAgent(llm)
-        self.formatter = ResponseFormatterAgent(llm)
-        self.task_service = TaskService(db)
-        self.user_service = UserService(db)
-        self.state_machine = StateMachine(db)
+        self.tool_executor = ToolExecutor(db, llm, scheduler)  # Runs tools safely
+        self.state_manager = StateManager(db)                   # FSM + ReAct state
+        self.safety = SafetyLayer()                             # Confirmation, limits
 ```
 
-### Agent Base Class
+### Tool Base Pattern
+
+Each tool is a simple async function registered in the Tool Registry:
 
 ```python
-from abc import ABC, abstractmethod
+# src/tools/task_tools.py
 
-class BaseAgent(ABC):
-    """Base class for all LLM agents."""
-
-    def __init__(self, llm: LLMClient, prompt_name: str):
-        self.llm = llm
-        self.prompt_name = prompt_name
-        self._prompt_template: str | None = None
-
-    async def get_prompt(self, **kwargs) -> str:
-        """Load and fill prompt template."""
-        if self._prompt_template is None:
-            self._prompt_template = await load_prompt(self.prompt_name)
-        return self._prompt_template.format(**kwargs)
-
-    @abstractmethod
-    async def run(self, **kwargs) -> dict:
-        """Execute the agent. Returns structured dict."""
-        ...
-
-    async def _call_llm_json(self, system_prompt: str, user_message: str) -> dict:
-        """Call LLM and parse JSON response with retry logic."""
-        return await safe_llm_json_call(self.llm, system_prompt, user_message)
+async def get_user_tasks(user_id: str, db: Database,
+                         status: str = "pending", category: str = None,
+                         due_date_from: str = None, **kwargs) -> dict:
+    """Fetch user's tasks with optional filters."""
+    filters = {"user_id": user_id}
+    if status != "all":
+        filters["status"] = status
+    # ... build query ...
+    tasks = await db.tasks.find(filters).to_list()
+    return {"count": len(tasks), "tasks": [...]}
 ```
 
-### Adding a New Agent (Contributor Guide)
+```python
+# src/orchestrator/tool_registry.py
 
-To add a new agent (e.g., a "task suggestion" agent):
+TOOL_REGISTRY = {
+    "get_user_tasks": {
+        "function": task_tools.get_user_tasks,
+        "description": "Fetch user's tasks with optional filters.",
+        "parameters": { ... },   # OpenAI function-calling schema
+        "side_effects": False,
+    },
+    # ... all other tools ...
+}
+```
 
-1. **Create prompt file:** `prompts/task_suggester.txt`
-2. **Create agent class:** `src/agents/task_suggester.py`
+### Adding a New Tool (Contributor Guide)
+
+To add a new tool (e.g., a "suggest_tasks" tool):
+
+1. **Create tool function:** `src/tools/suggestion_tools.py`
    ```python
-   from src.agents.base import BaseAgent
-
-   class TaskSuggesterAgent(BaseAgent):
-       def __init__(self, llm):
-           super().__init__(llm, "task_suggester")
-
-       async def run(self, user_id: str, current_tasks: list) -> dict:
-           prompt = await self.get_prompt(tasks=json.dumps(current_tasks))
-           return await self._call_llm_json(prompt, "Suggest tasks")
+   async def suggest_tasks(user_id: str, db: Database, llm: LLMClient) -> dict:
+       """Sub-agent: uses LLM to suggest tasks based on patterns."""
+       existing = await db.tasks.find({"user_id": user_id}).to_list()
+       prompt = f"Based on these tasks, suggest new ones: {existing}"
+       result = await llm.call_simple([{"role": "user", "content": prompt}])
+       return json.loads(result)
    ```
-3. **Register in orchestrator:** Add to `Orchestrator.__init__` and add routing logic
-4. **Add intent to classifier:** Update `prompts/classifier.txt` with new intent
-5. **Write tests:** `tests/test_task_suggester.py`
+2. **Register in tool registry:** `src/orchestrator/tool_registry.py`
+   ```python
+   "suggest_tasks": {
+       "function": suggestion_tools.suggest_tasks,
+       "description": "Suggest new tasks based on user's patterns and habits.",
+       "parameters": {},
+       "side_effects": False,
+   }
+   ```
+3. **Done.** The Planner LLM will see the new tool in its toolbox and call it when appropriate. No changes to the orchestrator, no new prompts needed.
 
 ---
 
@@ -388,24 +393,58 @@ services:
     depends_on:
       - mongo
     restart: unless-stopped
+    # SECURITY: non-root, read-only filesystem, resource limits
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+    networks:
+      - bot_net
     volumes:
-      - ./prompts:/app/prompts  # Hot-reload prompts without rebuild
+      - ./prompts:/app/prompts:ro  # Read-only, hot-reload without rebuild
 
   mongo:
     image: mongo:7
-    ports:
-      - "27017:27017"
+    # NO ports exposed to host — only reachable within bot_net
     volumes:
       - mongo_data:/data/db
+    networks:
+      - bot_net
+
+  # Optional: Ollama for local LLM (uncomment if using local models)
+  # ollama:
+  #   image: ollama/ollama
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   networks:
+  #     - bot_net
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - capabilities: [gpu]
+
+networks:
+  bot_net:
+    driver: bridge
 
 volumes:
   mongo_data:
+  # ollama_data:
 ```
 
 ### Dockerfile
 
 ```dockerfile
 FROM python:3.11-slim
+
+# Create non-root user
+RUN groupadd -r botuser && useradd -r -g botuser -u 1000 botuser
 
 WORKDIR /app
 
@@ -415,8 +454,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY prompts/ prompts/
 
+# Run as non-root
+USER botuser
+
 CMD ["python", "-m", "src.main"]
 ```
+
+### Why Docker Matters for an Agentic Bot
+
+The bot is controlled by an LLM that decides which tools to call. Even though our tools
+are well-typed Python functions (not arbitrary shell commands), Docker provides defense-in-depth:
+
+| Threat | Docker Mitigation |
+|--------|------------------|
+| LLM-triggered code execution bug | Read-only filesystem, non-root user |
+| Runaway loop consuming resources | CPU/memory limits |
+| Accessing host filesystem | Container isolation |
+| Reaching internal network services | Docker network isolation — bot can only reach Mongo + LLM |
+| Prompt injection leaking system data | No secrets on filesystem, env vars are minimal |
 
 ---
 
