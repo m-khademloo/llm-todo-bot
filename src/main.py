@@ -9,7 +9,8 @@ from src.bot.handlers import create_bot
 from src.tools.scheduling_tools import SchedulerService
 
 
-async def _setup():
+async def main() -> None:
+    """Run setup and bot in the same event loop so Motor (async Mongo) works."""
     settings = Settings()
     db = Database(settings.MONGO_URI, settings.MONGO_DB_NAME)
     await db.setup_indexes()
@@ -18,13 +19,11 @@ async def _setup():
     orchestrator = Orchestrator(db=db, llm=llm, scheduler=scheduler)
     bot = create_bot(settings.TELEGRAM_BOT_TOKEN, orchestrator)
     await scheduler.start(bot)
-    return bot
-
-
-def main() -> None:
-    bot = asyncio.run(_setup())
-    bot.run_polling()
+    await bot.initialize()
+    await bot.start()
+    await bot.updater.start_polling(drop_pending_updates=True)
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
