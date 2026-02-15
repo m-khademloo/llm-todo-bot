@@ -1,50 +1,25 @@
-version: "3.8"
+# Single stack: bot only. Mongo and LLM are external (host or cloud).
+# Set TELEGRAM_BOT_TOKEN, MONGO_URI, LLM_MODEL (and LLM_BASE_URL / API keys) in .env.
+# Works with: Ollama (host), OpenAI, DeepSeek, Claude, etc. via LiteLLM.
 
 services:
   bot:
     build: .
     env_file: .env
-    depends_on:
-      - ollama
     restart: unless-stopped
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - MONGO_URI=${MONGO_URI}
       - MONGO_DB_NAME=${MONGO_DB_NAME:-llm_todo_bot}
-      - LLM_MODEL=${LLM_MODEL:-ollama/deepseek-llm:7b}
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://ollama:11434}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.3}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-1000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - bot_net
 
-  # Optional: use external Mongo (e.g. dc-mongodb_container-1). Set MONGO_URI in .env.
-  # mongo:
-  #   image: mongo:7
-  #   environment:
-  #     MONGO_INITDB_ROOT_USERNAME: bot
-  #     MONGO_INITDB_ROOT_PASSWORD: llmtodo_secret_2025
-  #   volumes:
-  #     - mongo_data:/data/db
-  #   networks:
-  #     - bot_net
-  #   ports:
-  #     - "27017:27017"
-
-  ollama:
-    image: ollama/ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    networks:
-      - bot_net
-    ports:
-      - "11434:11434"
-    # Uncomment for GPU: deploy.resources.reservations.devices: [{"capabilities": ["gpu"]}]
-
 networks:
   bot_net:
     driver: bridge
-
-volumes:
-  mongo_data:
-  ollama_data:
